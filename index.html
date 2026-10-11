@@ -1,0 +1,222 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="color-scheme" content="dark">
+<meta name="theme-color" content="#000000">
+<title>毫秒时钟 · 视频延迟测试</title>
+<style>
+  :root { color-scheme: dark; }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  html, body { height: 100%; }
+  body {
+    background: #000; color: #fff;
+    min-height: 100dvh;
+    display: grid; place-items: center;
+    font-family: ui-monospace, "SF Mono", "Cascadia Mono", "JetBrains Mono",
+                 "Roboto Mono", Consolas, "DejaVu Sans Mono", monospace;
+    -webkit-user-select: none; user-select: none;
+    -webkit-tap-highlight-color: transparent;
+    overflow: hidden;
+  }
+  #stage {
+    display: flex; flex-direction: column; align-items: center;
+    gap: 2.2vmin; padding: 2vmin;
+  }
+  #clock {
+    display: flex; align-items: baseline;
+    font-size: min(11vw, 26vh);
+    line-height: 1; font-weight: 700;
+    font-variant-numeric: tabular-nums;
+    font-feature-settings: "tnum" 1;
+    letter-spacing: 0.01em;
+    contain: layout paint;
+  }
+  #clock .sep, #clock .dot { opacity: .55; }
+  #date {
+    color: #9a9a9a;
+    font-size: clamp(0.85rem, 2.4vmin, 1.5rem);
+    letter-spacing: 0.08em; text-align: center;
+  }
+  #bar {
+    width: 100%; height: max(3px, 0.7vmin);
+    background: #222; border-radius: 2px; overflow: hidden;
+  }
+  #barfill {
+    height: 100%; width: 100%; background: #fff;
+    transform-origin: 0 50%; transform: scaleX(0);
+  }
+  body.nobar #bar { display: none; }
+  body.minimal #date, body.minimal #bar, body.minimal #hud { display: none; }
+  #hud {
+    position: fixed; left: 0; right: 0; bottom: max(1.2vmin, 10px);
+    display: flex; justify-content: center; align-items: center;
+    gap: 1.2em; flex-wrap: wrap;
+    color: #7a7a7a; font-size: clamp(0.7rem, 1.6vmin, 0.95rem);
+    transition: opacity 0.25s ease;
+  }
+  #hud button {
+    background: none; border: 1px solid #333; border-radius: 4px;
+    color: #9a9a9a; font: inherit; padding: 0.25em 0.7em; cursor: pointer;
+  }
+  #hud button:hover { border-color: #666; color: #fff; }
+  #fps { color: #555; font-variant-numeric: tabular-nums; }
+  body.idle { cursor: none; }
+  body.idle #hud { opacity: 0; }
+  body.idle #hud:hover { opacity: 1; }
+</style>
+</head>
+<body>
+<main id="stage">
+  <time id="clock" datetime="">
+    <span class="d" id="hh">--</span><span class="sep">:</span><span class="d" id="mm">--</span><span class="sep">:</span><span class="d" id="ss">--</span><span class="dot">.</span><span class="d" id="ms">---</span>
+  </time>
+  <div id="bar" aria-hidden="true"><div id="barfill"></div></div>
+  <div id="date"></div>
+</main>
+<footer id="hud">
+  <button id="btn-fs" type="button">全屏 (F)</button>
+  <button id="btn-bar" type="button">隐藏进度条 (B)</button>
+  <button id="btn-min" type="button">极简 (H)</button>
+  <span>双击全屏</span>
+  <span id="fps"></span>
+</footer>
+<script>
+(() => {
+'use strict';
+const $ = id => document.getElementById(id);
+const els = {
+  clock: $('clock'), hh: $('hh'), mm: $('mm'), ss: $('ss'), ms: $('ms'),
+  date: $('date'), barfill: $('barfill'), fps: $('fps'),
+  btnFs: $('btn-fs'), btnBar: $('btn-bar'), btnMin: $('btn-min'),
+};
+
+/* 时间基准：performance.now() 单调递增、不受系统时间跳变（NTP 等）影响；
+   启动时与墙钟对齐一次，页面重新可见时再校准，防止休眠后偏离 */
+let epochOffset = Date.now() - performance.now();
+const resync = () => { epochOffset = Date.now() - performance.now(); };
+
+const pad = (n, w) => String(n).padStart(w, '0');
+
+/* 日期行只在跨天时重建，避免每帧做无谓的字符串工作 */
+const TZ = Intl.DateTimeFormat().resolvedOptions().timeZone || '本地';
+let dateKey = -1;
+function renderDate(d) {
+  const key = d.getFullYear() * 10000 + (d.getMonth() + 1) * 100 + d.getDate();
+  if (key === dateKey) return;
+  dateKey = key;
+  const week = '日一二三四五六'[d.getDay()];
+  const offMin = -d.getTimezoneOffset();
+  const off = (offMin < 0 ? '-' : '+') +
+    pad(Math.floor(Math.abs(offMin) / 60), 2) + ':' + pad(Math.abs(offMin) % 60, 2);
+  els.date.textContent =
+    `${d.getFullYear()}-${pad(d.getMonth() + 1, 2)}-${pad(d.getDate(), 2)} ` +
+    `星期${week} ${TZ} UTC${off}`;
+}
+
+/* fps：告知毫秒数字的真实更新粒度（60Hz 屏 ≈ 16.7ms/帧步进） */
+let frames = 0, fpsLast = performance.now(), fpsEma = 0;
+function tickFps(now) {
+  frames++;
+  const span = now - fpsLast;
+  if (span >= 500) {
+    const inst = frames * 1000 / span;
+    fpsEma = fpsEma ? fpsEma * 0.7 + inst * 0.3 : inst;
+    frames = 0; fpsLast = now;
+    const text = `${Math.round(fpsEma)} fps · ${(1000 / fpsEma).toFixed(1)} ms/帧`;
+    if (els.fps.textContent !== text) els.fps.textContent = text;
+  }
+}
+
+/* 每帧渲染：rAF 前台以屏幕刷新率运行，后台自动暂停（本页需保持前台可见） */
+function frame() {
+  const now = performance.now();
+  const d = new Date(epochOffset + now);
+
+  const hh = pad(d.getHours(), 2);
+  const mm = pad(d.getMinutes(), 2);
+  const ss = pad(d.getSeconds(), 2);
+  const ms = pad(d.getMilliseconds(), 3);
+  if (els.hh.textContent !== hh) els.hh.textContent = hh;
+  if (els.mm.textContent !== mm) els.mm.textContent = mm;
+  if (els.ss.textContent !== ss) {
+    els.ss.textContent = ss;
+    els.clock.dateTime = d.toISOString();
+  }
+  if (els.ms.textContent !== ms) els.ms.textContent = ms;
+
+  renderDate(d);
+  /* 秒进度条：一秒一个周期的视觉心跳，兼作采集画面里的活体指示 */
+  els.barfill.style.transform = `scaleX(${d.getMilliseconds() / 1000})`;
+
+  tickFps(now);
+  requestAnimationFrame(frame);
+}
+
+async function toggleFullscreen() {
+  try {
+    if (document.fullscreenElement) await document.exitFullscreen();
+    else await document.documentElement.requestFullscreen();
+  } catch (_) { /* 被浏览器策略拦截时静默忽略 */ }
+}
+document.addEventListener('fullscreenchange', () => {
+  els.btnFs.textContent = document.fullscreenElement ? '退出全屏 (F)' : '全屏 (F)';
+});
+
+function toggleBar() {
+  const hidden = document.body.classList.toggle('nobar');
+  els.btnBar.textContent = hidden ? '显示进度条 (B)' : '隐藏进度条 (B)';
+}
+function toggleMinimal() {
+  const minimal = document.body.classList.toggle('minimal');
+  els.btnMin.textContent = minimal ? '完整界面 (H)' : '极简 (H)';
+}
+
+addEventListener('keydown', e => {
+  if (e.ctrlKey || e.metaKey || e.altKey) return;
+  switch (e.key.toLowerCase()) {
+    case 'f': toggleFullscreen(); break;
+    case 'b': toggleBar(); break;
+    case 'h': toggleMinimal(); break;
+  }
+});
+document.documentElement.addEventListener('dblclick', toggleFullscreen);
+els.btnFs.addEventListener('click', toggleFullscreen);
+els.btnBar.addEventListener('click', toggleBar);
+els.btnMin.addEventListener('click', toggleMinimal);
+
+/* 屏幕常亮：延迟测试期间防止系统熄屏/休眠 */
+let wakeLock = null;
+async function acquireWakeLock() {
+  if (!('wakeLock' in navigator) || document.hidden) return;
+  try {
+    wakeLock = await navigator.wakeLock.request('screen');
+    wakeLock.addEventListener('release', () => { wakeLock = null; });
+  } catch (_) { wakeLock = null; }
+}
+
+document.addEventListener('visibilitychange', () => {
+  if (document.hidden) return;
+  resync();              // 休眠/后台回来后重新对齐墙钟
+  acquireWakeLock();
+});
+
+/* 光标与操作条静止 3 秒后自动隐藏，避免入镜 */
+let idleTimer = 0;
+function poke() {
+  document.body.classList.remove('idle');
+  clearTimeout(idleTimer);
+  idleTimer = setTimeout(() => document.body.classList.add('idle'), 3000);
+}
+['mousemove', 'mousedown', 'touchstart'].forEach(type =>
+  addEventListener(type, poke, { passive: true }));
+poke();
+
+resync();
+acquireWakeLock();
+requestAnimationFrame(frame);
+})();
+</script>
+</body>
+</html>
